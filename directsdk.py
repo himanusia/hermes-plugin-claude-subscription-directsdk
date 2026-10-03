@@ -160,8 +160,12 @@ def normalize_input_schema(schema):
 
 
 def request_body(kwargs):
+    # extra_headers: the host's Relay layer adds HTTP headers (W3C ``traceparent``) to every
+    # chat_completions call. This transport is a local process with no HTTP hop, so they are
+    # accepted and dropped; rejecting them failed every turn over to the fallback provider.
     allowed = {'model', 'messages', 'tools', 'stream', 'stream_options', 'max_tokens', 'max_completion_tokens',
-               'temperature', 'top_p', 'stop', 'extra_body', 'timeout', 'tool_choice', 'parallel_tool_calls', 'n', 'response_format'}
+               'temperature', 'top_p', 'stop', 'extra_body', 'extra_headers', 'timeout', 'tool_choice',
+               'parallel_tool_calls', 'n', 'response_format'}
     unknown = set(kwargs) - allowed
     if unknown:
         raise ValueError('Unsupported request parameters: ' + ', '.join(sorted(unknown)))
