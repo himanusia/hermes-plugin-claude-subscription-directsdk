@@ -160,15 +160,22 @@ def normalize_input_schema(schema):
 
 
 def request_body(kwargs):
-    # extra_headers: the host's Relay layer adds HTTP headers (W3C ``traceparent``) to every
-    # chat_completions call. This transport is a local process with no HTTP hop, so they are
-    # accepted and dropped; rejecting them failed every turn over to the fallback provider.
+    # extra_headers: the host's Relay layer adds a W3C ``traceparent`` to every
+    # chat_completions call. This transport is a local process with no HTTP hop, so it is
+    # dropped; rejecting it failed every turn over to the fallback provider.
     allowed = {'model', 'messages', 'tools', 'stream', 'stream_options', 'max_tokens', 'max_completion_tokens',
                'temperature', 'top_p', 'stop', 'extra_body', 'extra_headers', 'timeout', 'tool_choice',
                'parallel_tool_calls', 'n', 'response_format'}
     unknown = set(kwargs) - allowed
     if unknown:
         raise ValueError('Unsupported request parameters: ' + ', '.join(sorted(unknown)))
+    # Only the Relay trace header is tolerated (same rule as upstream PR #85): any
+    # other header, e.g. an Authorization override, stays fail-closed.
+    headers = kwargs.get('extra_headers')
+    if headers is not None and (not isinstance(headers, dict) or any(
+            not isinstance(key, str) or key.lower() != 'traceparent' or not isinstance(value, str)
+            for key, value in headers.items())):
+        raise ValueError('extra_headers supports host traceparent metadata only')
     if kwargs.get('n', 1) != 1 or kwargs.get('tool_choice', 'auto') not in ('auto', None):
         raise ValueError('Only n=1 and tool_choice=auto are supported')
     if kwargs.get('parallel_tool_calls') is False:

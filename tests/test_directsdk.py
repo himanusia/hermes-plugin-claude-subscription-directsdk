@@ -281,6 +281,8 @@ class Contract(unittest.TestCase):
                 {"temperature": float("nan")},
                 {"tool_choice": "required"},
                 {"n": 2},
+                {"extra_headers": {"Authorization": "Bearer other"}},
+                {"extra_headers": {"traceparent": 1}},
             ):
                 with self.assertRaises(ValueError):
                     client.chat.completions.create(**self.request(), **bad)
