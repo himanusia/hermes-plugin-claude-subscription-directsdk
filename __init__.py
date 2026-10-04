@@ -78,6 +78,18 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
         return ({'reasoning': dict(reasoning_config)} if reasoning_config else {}), {}
 
 
+def classify_api_error(error, **_):
+    """Request validation is deterministic: the same kwargs fail the same way on every attempt.
+
+    ``request_body``/``prepare_history`` raise ValueError before any native child or upstream
+    call, so the host's default retry (3 attempts with backoff) only repeats the refusal. Report it
+    as a non-retryable format error; native/transport failures keep the host's default policy.
+    """
+    if isinstance(error, ValueError):
+        return {'reason': 'format_error', 'retryable': False, 'should_fallback': False}
+    return None
+
+
 profile = ClaudeOAuthDirectSDKProfile(
     name='claude-subscription-directsdk-experimental',
     display_name='Claude Subscription DirectSDK (Experimental)',
@@ -94,6 +106,7 @@ profile = ClaudeOAuthDirectSDKProfile(
     default_aux_model='claude-sonnet-5[1m]',
     fallback_models=tuple(MODEL_METADATA),
     model_aliases={alias: native_model(alias) for alias in ALIASES},
+    classify_api_error=classify_api_error,
 )
 register_provider(profile)
 

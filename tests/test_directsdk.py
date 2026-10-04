@@ -281,9 +281,17 @@ class Contract(unittest.TestCase):
                 {"temperature": float("nan")},
                 {"tool_choice": "required"},
                 {"n": 2},
+                {"extra_headers": {"Authorization": "Bearer other"}},
+                {"extra_headers": {"traceparent": 1}},
             ):
                 with self.assertRaises(ValueError):
                     client.chat.completions.create(**self.request(), **bad)
+
+            # Host Relay tracing headers ride on every call; they must not fail the request.
+            traced = client.chat.completions.create(
+                **self.request(), extra_headers={"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01"}
+            )
+            self.assertEqual(traced.choices[0].finish_reason, "tool_calls")
 
             async def run():
                 result = await client.chat.completions.create(**self.request())
