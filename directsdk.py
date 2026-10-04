@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -37,6 +38,8 @@ class ClaudeCodeMissing(RuntimeError):
 class ClaudeCodeLoggedOut(RuntimeError):
     """Claude Code refused before any upstream request because it has no usable login where Hermes runs it."""
 
+
+logger = logging.getLogger(__name__)
 
 CARRIER = 'claude-subscription-directsdk-experimental.native_assistant'
 PREFIX = 'mcp__hermes__'
@@ -352,6 +355,52 @@ class Stream:
         self.close()
 
 
+class _Pending:
+    """``create()`` result on a thread with a running loop: awaitable for async callers,
+    resolved in place on first synchronous use (attribute access or iteration). Runs once."""
+
+    def __init__(self, client, kwargs):
+        self._client, self._kwargs = client, kwargs
+        self._lock, self._done, self._value, self._error = threading.Lock(), False, None, None
+
+    def _resolve(self):
+        with self._lock:
+            if not self._done:
+                try:
+                    self._value = self._client._create(**self._kwargs)
+                except BaseException as error:
+                    self._error = error
+                self._done = True
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+    def __await__(self):
+        if self._done:
+            async def ready():
+                return self._resolve()
+            return ready().__await__()
+        async def run():
+            # Mark the work as owned before leaving the loop so a racing sync access waits on it.
+            result = await self._client._acreate(**self._kwargs)
+            with self._lock:
+                self._done, self._value = True, result
+            return result
+        return run().__await__()
+
+    def __getattr__(self, name):
+        if name.startswith('_'):
+            raise AttributeError(name)
+        return getattr(self._resolve(), name)
+
+    def __iter__(self):
+        return iter(self._resolve())
+
+    def close(self):
+        if self._done and self._error is None and hasattr(self._value, 'close'):
+            self._value.close()
+
+
 class AsyncStream:
     def __init__(self, stream):
         self.stream = stream
@@ -467,14 +516,16 @@ class Client:
             return self._owned_cwd
 
     def create(self, **kwargs):
-        # Hermes' auxiliary seam returns this same object and awaits create.
+        # Hermes' auxiliary seam returns this same object and awaits create, but a synchronous
+        # caller can also run on a thread with a live loop (Relay drives sync provider callbacks
+        # from inside a task). A running loop does not say which one called: return a result that
+        # works both ways instead of guessing (a guessed coroutine reached title generation as
+        # "invalid response" and pushed it onto the fallback provider).
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            pass
-        else:
-            return self._acreate(**kwargs)
-        return self._create(**kwargs)
+            return self._create(**kwargs)
+        return _Pending(self, kwargs)
 
     async def _acreate(self, **kwargs):
         task = asyncio.create_task(asyncio.to_thread(self._create, **kwargs))
@@ -509,6 +560,7 @@ class Client:
     def _run(self, request, kwargs, body, manifest, names, system, frames):
         p = None
         reader = None
+        stderr_file = None
         try:
             timeout = kwargs.get('timeout', self.timeout)
             timeout = getattr(timeout, 'read', timeout)
@@ -556,7 +608,20 @@ class Client:
                 effort = parsed.get('output_config', {}).get('effort')
                 if effort:
                     command += ['--effort', effort]
-                p = request.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding='utf-8', cwd=self._workdir(), env=env)
+                # Native's stderr is the only place it says why it quit (bad flag, auth, crash): keep it
+                # in a file (no pipe to drain, no deadlock) and attach its tail to every native failure.
+                stderr_file = open(root / 'stderr.log', 'w+', encoding='utf-8', errors='replace')
+                def native_detail():
+                    try:
+                        stderr_file.flush()
+                        stderr_file.seek(0)
+                        tail = stderr_file.read()[-600:].strip()
+                    except (OSError, ValueError):
+                        tail = ''
+                    code = p.poll() if p is not None else None
+                    parts = ([f'exit {code}'] if code is not None else []) + ([f'stderr: {tail}'] if tail else [])
+                    return f' ({"; ".join(parts)})' if parts else ''
+                p = request.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_file, text=True, encoding='utf-8', cwd=self._workdir(), env=env)
                 events = queue.Queue()
                 def read():
                     try:
@@ -599,7 +664,7 @@ class Client:
                         while True:
                             ack = receive()
                             if ack is None:
-                                raise RuntimeError('Native exited before replay acknowledgment')
+                                raise RuntimeError('Native exited before replay acknowledgment' + native_detail())
                             if ack.get('type') == 'result':
                                 if ack.get('num_turns') != 0 or ack.get('is_error'):
                                     raise RuntimeError('Native history replay not supported: expected zero-turn acknowledgment')
@@ -651,19 +716,24 @@ class Client:
                         raise ClaudeCodeLoggedOut(f'{LOGGED_OUT_HINT} (native: {native_error})')
                     raise RuntimeError('Native API error: ' + native_error)
                 if len(results) != 1 or not assistants or not stopped:
-                    raise RuntimeError('Incomplete native response: assistant, message_stop and one result required')
+                    raise RuntimeError('Incomplete native response: assistant, message_stop and one result required' + native_detail())
                 final = results[0]
                 blocks = [b for a in assistants for b in a['content']]
                 calls = []
                 for block in blocks:
                     if block.get('type') == 'tool_use':
                         name = block['name']
-                        if not name.startswith(PREFIX) or name[len(PREFIX):] not in names:
-                            raise RuntimeError('Native returned a tool outside the current host inventory')
-                        calls.append({'id': block['id'], 'type': 'function', 'function': {'name': name[len(PREFIX):], 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
+                        host_name = name[len(PREFIX):] if name.startswith(PREFIX) else name
+                        if host_name not in names:
+                            # A valid reply naming a tool this turn does not offer. Discarding it and
+                            # re-asking from scratch burned whole requests (and quota) on a model slip;
+                            # Hermes already answers an unknown name with a tool error the model can
+                            # correct from, so pass the call through and name it in the log.
+                            logger.warning('Native called a tool outside the current host inventory: %r', name)
+                        calls.append({'id': block['id'], 'type': 'function', 'function': {'name': host_name, 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
                 boundary = bool(calls) and final.get('subtype') == 'error_max_turns' and p.returncode == 1
                 if not boundary and not native_failure_handled and (p.returncode != 0 or final.get('is_error') or final.get('subtype') != 'success'):
-                    raise RuntimeError('Native request failed: ' + str(final.get('subtype')))
+                    raise RuntimeError('Native request failed: ' + str(final.get('subtype')) + native_detail())
                 usage = assistants[0]['usage'] if admission.used else final.get('usage')
                 if not isinstance(usage, dict) or not all(isinstance(usage.get(k), (int, float)) for k in ('input_tokens', 'output_tokens')):
                     raise RuntimeError('Native result missing complete token usage')
@@ -698,6 +768,8 @@ class Client:
                 for pipe in (p.stdin, p.stdout):
                     if pipe and not pipe.closed:
                         pipe.close()
+            if stderr_file is not None:
+                stderr_file.close()
             with self._lock:
                 self._requests.discard(request)
 
